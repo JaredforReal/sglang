@@ -108,10 +108,24 @@ class GlmAsrRotaryEmbedding(nn.Module):
 
         self.head_dim = config.hidden_size // config.num_attention_heads
         # GLM-ASR uses partial rotary factor
-        self.rotary_ndims = int(self.head_dim * config.partial_rotary_factor)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        self.rotary_ndims = int(self.head_dim * partial_rotary_factor)
+
+        # Get rope_theta from config - try multiple attribute names for compatibility
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = getattr(config, "default_theta", None)
+        if (
+            rope_theta is None
+            and hasattr(config, "rope_scaling")
+            and config.rope_scaling
+        ):
+            rope_theta = config.rope_scaling.get("rope_theta", 10000.0)
+        if rope_theta is None:
+            rope_theta = 10000.0
 
         inv_freq = 1.0 / (
-            config.rope_theta
+            rope_theta
             ** (
                 torch.arange(0, self.rotary_ndims, 2, dtype=torch.float32)
                 / self.rotary_ndims
