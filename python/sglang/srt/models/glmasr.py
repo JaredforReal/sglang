@@ -257,12 +257,14 @@ class GlmAsrAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for attention.
 
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
             position_embeddings: (cos, sin) tuple for rotary embeddings
+            attention_mask: [batch_size, 1, seq_len, seq_len] or similar
 
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
@@ -296,7 +298,7 @@ class GlmAsrAttention(nn.Module):
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attention_mask,
             dropout_p=0.0,
             is_causal=False,
         )
@@ -341,12 +343,14 @@ class GlmAsrEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with pre-norm and residual connections.
 
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
             position_embeddings: (cos, sin) tuple for rotary embeddings
+            attention_mask: Attention mask
 
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
@@ -357,6 +361,7 @@ class GlmAsrEncoderLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
         )
         hidden_states = residual + hidden_states
 
@@ -429,12 +434,14 @@ class GlmAsrEncoder(nn.Module):
     def forward(
         self,
         input_features: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> BaseModelOutput:
         """Forward pass through the audio encoder.
 
         Args:
             input_features: Mel-spectrogram features [batch, num_mel_bins, time]
+            attention_mask: Attention mask [batch, 1, seq_len, seq_len]
 
         Returns:
             BaseModelOutput with last_hidden_state of shape [batch, seq_len, hidden_size]
@@ -459,6 +466,7 @@ class GlmAsrEncoder(nn.Module):
             hidden_states = encoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
             )
 
         # Final layer normalization
@@ -514,14 +522,73 @@ class GlmAsrForConditionalGeneration(nn.Module):
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items
-        input_features = torch.cat([item.feature for item in items], dim=0).type(
-            self.audio_tower.dtype
-        )
+        features = [item.feature for item in items]
 
-        audio_embeds = self.audio_tower(input_features).last_hidden_state
-        audio_embeds = audio_embeds.reshape(
-            -1, self.config.audio_config.intermediate_size
-        )
+        # Check if all have same shape
+        shapes = [f.shape for f in features]
+        max_len = max(s[-1] for s in shapes)
+        device = self.audio_tower.conv1.weight.device
+        dtype = self.audio_tower.dtype
+
+        if all(s[-1] == max_len for s in shapes):
+            input_features = torch.cat(features, dim=0).to(device=device, dtype=dtype)
+            attention_mask = None
+            seq_lens = None
+        else:
+            # Pad
+            batch_size = len(features)
+            num_mel_bins = shapes[0][
+                1
+            ]  # [1, num_mel_bins, time] or [num_mel_bins, time]?
+            # Existing code: torch.cat([item.feature], dim=0)
+            # If item.feature is [num_mel_bins, time], cat(dim=0) -> [N*num_mel_bins, time] -> WRONG for conv1d
+            # conv1d expects [batch, channels, time].
+            # So item.feature MUST be [1, num_mel_bins, time].
+            # Let's assume item.feature is [1, num_mel_bins, time].
+
+            num_mel_bins = shapes[0][1]
+            input_features = torch.zeros(
+                (batch_size, num_mel_bins, max_len), dtype=dtype, device=device
+            )
+
+            seq_lens = []
+            for i, f in enumerate(features):
+                # f is [1, bins, time]
+                l = f.shape[-1]
+                input_features[i, :, :l] = f.to(device=device, dtype=dtype)
+                # Calculate seq len after convs
+                # conv1: l
+                # conv2: floor((l+1)/2)
+                seq_len = (l + 1) // 2
+                seq_lens.append(seq_len)
+
+            max_seq_len = (max_len + 1) // 2
+
+            # Create float mask: 0.0 for valid, -inf for padding
+            attention_mask = torch.full(
+                (batch_size, 1, max_seq_len, max_seq_len),
+                torch.finfo(dtype).min,
+                dtype=dtype,
+                device=device,
+            )
+            for i, l in enumerate(seq_lens):
+                attention_mask[i, :, :l, :l] = 0.0
+
+        audio_embeds = self.audio_tower(
+            input_features, attention_mask=attention_mask
+        ).last_hidden_state
+
+        if seq_lens is not None:
+            # Extract valid tokens
+            valid_embeds = []
+            for i, l in enumerate(seq_lens):
+                valid_embeds.append(audio_embeds[i, :l, :])
+            audio_embeds = torch.cat(valid_embeds, dim=0)
+        else:
+            audio_embeds = audio_embeds.reshape(
+                -1, self.config.audio_config.intermediate_size
+            )
+
         audio_embeds = self.multi_modal_projector(audio_embeds)
 
         return audio_embeds
