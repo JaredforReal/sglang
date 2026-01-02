@@ -548,7 +548,12 @@ def _get_chunked_prefill_embedding(
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
-    embedding_list = []
+    embedding_list = [None] * len(prefix_length)
+
+    requests_to_compute_indices = []
+    items_to_compute = []
+    req_to_items_info = {}
+
     # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
     max_iterations = min(len(items_size) - 1, len(prefix_length))
     for i in range(max_iterations):
@@ -563,8 +568,51 @@ def _get_chunked_prefill_embedding(
         item_hashes = [item.hash for item in embedding_items_per_req]
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
-        if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
+        if embedding_per_req is not None:
+            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+                embedding=embedding_per_req,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
+                items_offset=items_offset,
+            )
+            embedding_list[i] = embedding_per_req_chunk
+        else:
+            requests_to_compute_indices.append(i)
+            items_to_compute.extend(embedding_items_per_req)
+
+            item_lengths = []
+            for item in embedding_items_per_req:
+                length = sum(end - start + 1 for start, end in item.offsets)
+                item_lengths.append(length)
+
+            req_to_items_info[i] = {
+                "hashes": item_hashes,
+                "lengths": item_lengths,
+                "items_count": len(embedding_items_per_req),
+            }
+
+    if items_to_compute:
+        all_embeddings = data_embedding_func(items_to_compute)
+
+        all_lengths = []
+        for i in requests_to_compute_indices:
+            all_lengths.extend(req_to_items_info[i]["lengths"])
+
+        split_embeddings = torch.split(all_embeddings, all_lengths)
+
+        current_split_idx = 0
+        for i in requests_to_compute_indices:
+            info = req_to_items_info[i]
+            num_items = info["items_count"]
+            item_embeddings = split_embeddings[
+                current_split_idx : current_split_idx + num_items
+            ]
+            current_split_idx += num_items
+
+            embedding_per_req = torch.cat(item_embeddings, dim=0)
+
+            item_hashes = info["hashes"]
+            embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
@@ -573,13 +621,16 @@ def _get_chunked_prefill_embedding(
                     "embedding size."
                 )
 
-        embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embedding_per_req,
-            extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
-            items_offset=items_offset,
-        )
-        embedding_list.append(embedding_per_req_chunk)
+            items_offset = items_offset_list[i]
+            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+                embedding=embedding_per_req,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
+                items_offset=items_offset,
+            )
+            embedding_list[i] = embedding_per_req_chunk
+
+    embedding_list = [e for e in embedding_list if e is not None]
     if len(embedding_list) == 0:
         return None
     return torch.concat(embedding_list, dim=0)
