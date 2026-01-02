@@ -581,8 +581,26 @@ def _get_chunked_prefill_embedding(
             items_to_compute.extend(embedding_items_per_req)
 
             item_lengths = []
+
+            def _estimate_item_length(it: MultimodalDataItem) -> int:
+                # Prefer to derive length from raw feature shape to match encoder output.
+                if (
+                    it.modality == Modality.AUDIO
+                    and hasattr(it, "feature")
+                    and hasattr(it.feature, "shape")
+                    and len(it.feature.shape) >= 3
+                ):
+                    l = int(it.feature.shape[-1])
+                    for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+                        l = (l + 2 * padding - (kernel_size - 1) - 1) // stride + 1
+                    l = (l - 4) // 4 + 1
+                    if l > 0:
+                        return l
+                # Fallback to offsets if feature-based inference is unavailable
+                return sum(end - start for start, end in it.offsets)
+
             for item in embedding_items_per_req:
-                length = sum(end - start + 1 for start, end in item.offsets)
+                length = _estimate_item_length(item)
                 item_lengths.append(length)
 
             req_to_items_info[i] = {

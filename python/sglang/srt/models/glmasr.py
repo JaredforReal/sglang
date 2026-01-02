@@ -529,23 +529,17 @@ class GlmAsrForConditionalGeneration(nn.Module):
         max_len = max(s[-1] for s in shapes)
         device = self.audio_tower.conv1.weight.device
         dtype = self.audio_tower.dtype
+        batch_size = len(features)
+
+        raw_lengths = []  # original time lengths before convs
 
         if all(s[-1] == max_len for s in shapes):
             input_features = torch.cat(features, dim=0).to(device=device, dtype=dtype)
             attention_mask = None
             seq_lens = None
+            raw_lengths = [s[-1] for s in shapes]
         else:
-            # Pad
-            batch_size = len(features)
-            num_mel_bins = shapes[0][
-                1
-            ]  # [1, num_mel_bins, time] or [num_mel_bins, time]?
-            # Existing code: torch.cat([item.feature], dim=0)
-            # If item.feature is [num_mel_bins, time], cat(dim=0) -> [N*num_mel_bins, time] -> WRONG for conv1d
-            # conv1d expects [batch, channels, time].
-            # So item.feature MUST be [1, num_mel_bins, time].
-            # Let's assume item.feature is [1, num_mel_bins, time].
-
+            # Pad to max_len on time dimension
             num_mel_bins = shapes[0][1]
             input_features = torch.zeros(
                 (batch_size, num_mel_bins, max_len), dtype=dtype, device=device
@@ -555,10 +549,9 @@ class GlmAsrForConditionalGeneration(nn.Module):
             for i, f in enumerate(features):
                 # f is [1, bins, time]
                 l = f.shape[-1]
+                raw_lengths.append(l)
                 input_features[i, :, :l] = f.to(device=device, dtype=dtype)
-                # Calculate seq len after convs
-                # conv1: l
-                # conv2: floor((l+1)/2)
+                # conv1 stride 1 keeps length, conv2 stride 2 halves length (ceil)
                 seq_len = (l + 1) // 2
                 seq_lens.append(seq_len)
 
@@ -574,22 +567,36 @@ class GlmAsrForConditionalGeneration(nn.Module):
             for i, l in enumerate(seq_lens):
                 attention_mask[i, :, :l, :l] = 0.0
 
-        audio_embeds = self.audio_tower(
+        # Encoder forward
+        encoder_out = self.audio_tower(
             input_features, attention_mask=attention_mask
         ).last_hidden_state
 
-        if seq_lens is not None:
-            # Extract valid tokens
-            valid_embeds = []
-            for i, l in enumerate(seq_lens):
-                valid_embeds.append(audio_embeds[i, :l, :])
-            audio_embeds = torch.cat(valid_embeds, dim=0)
-        else:
-            audio_embeds = audio_embeds.reshape(
-                -1, self.config.audio_config.intermediate_size
-            )
+        # Reshape to match HF reference: (batch, -1, intermediate_size)
+        encoder_out = encoder_out.reshape(
+            batch_size, -1, self.config.audio_config.intermediate_size
+        )
 
-        audio_embeds = self.multi_modal_projector(audio_embeds)
+        # Project to LLM hidden size
+        audio_embeds = self.multi_modal_projector(encoder_out)
+
+        # Compute valid lengths following HF logic using original raw lengths
+        if not raw_lengths:
+            raw_lengths = [max_len for _ in range(batch_size)]
+
+        audio_lengths = torch.tensor(raw_lengths, device=device, dtype=torch.long)
+        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+            audio_lengths = (
+                audio_lengths + 2 * padding - (kernel_size - 1) - 1
+            ) // stride + 1
+
+        merge_factor = 4
+        post_lengths = (audio_lengths - merge_factor) // merge_factor + 1
+
+        # Mask out padded timesteps after merge
+        seq_range = torch.arange(audio_embeds.shape[1], device=device)[None, :]
+        valid_mask = seq_range < post_lengths[:, None]
+        audio_embeds = audio_embeds[valid_mask]
 
         return audio_embeds
 
