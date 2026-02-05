@@ -1194,6 +1194,7 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
@@ -2319,6 +2320,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -2648,6 +2650,7 @@ class ServerArgs:
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
+                        "GlmMoeDsaForCausalLM",
                     ]
                 except Exception:
                     pass
@@ -5644,6 +5647,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",

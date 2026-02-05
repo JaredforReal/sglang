@@ -1150,7 +1150,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         if self.use_nsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            is_neox_style = not getattr(config, "indexer_rope_interleave", True)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1193,7 +1193,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
-            is_neox_style = not getattr(config, "rope_interleave", False)
+            is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
